@@ -1,0 +1,394 @@
+%\documentclass[a4paper,twocolumn]{article}
+\documentclass[a4paper]{article}
+
+
+%% Language and font encodings
+\usepackage[english]{babel}
+\usepackage[utf8x]{inputenc}
+\usepackage[T1]{fontenc}
+
+%% Sets page size and margins
+\usepackage[a4paper,top=3cm,bottom=2cm,left=3cm,right=3cm,marginparwidth=1.75cm]{geometry}
+
+
+
+%% Useful packages
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorinlistoftodos]{todonotes}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+\title{A primer on blockchain design}
+\author{Dmitrii Zhelezov}
+
+
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+A typical blockchain lifecycle consists of
+\begin{enumerate}
+\item Peer discovery and transaction broadcasting (usually using a gossip protocol)
+\item Transaction block generation and broadcasting
+\item Block verification and local state updates by network nodes
+\item Network consensus on a new global state
+\end{enumerate}
+
+In this note we will concentrate on the last three steps and discuss main challenges a modern blockchain implementation has to tackle. In particular, we'll see how the much hyped but often poorly understood\footnote{An excellent Twitter-based \#microlecture \cite{microlecture} by Emin G\"un Sirer highlighted the lack of a common reference and served as an inspiration.}
+concepts  PoW (Proof of Work), PoS (Proof of Stake), DAG (Directed Acyclic Graph) fit into a general blockchain design and why building a robust blockchain network is hard. 
+  
+  While mostly informal, I tried to find a balance between readability and detalization. The goal was to make an exposition which is easier to read than an typical academic paper yet more detailed than a typical (video)blog. It's inevitable that many important points are missed or poorly explained, so I recommend to use complementary materials, e.g. an excellent survey \cite{DLT} with graphical explanations of the inner workings of distributed systems.
+
+
+\section{TL;DR}
+
+\begin{enumerate}
+ \item Section~\ref{sec:chain}. Consensus is needed since each participant has it own slightly different view of the world.
+  
+  \item Section~\ref{sec:double_spend}. Finality is needed to prevent double-spends.
+ 
+ \item Section~\ref{sec:sybil}. If you can flood the network with many clones (Sybils) supporting you, you can revert the consensus. Finality is incompatible with Sybil attacks, thus Sybil attacks should be hard.
+
+\item Section~\ref{sec:Nakomoto_and_PoW}. PoW is a Sybil resistance scheme (not a consensus protocol): one has to spend a lot of resources to propose a block, so a Sybil attack is expensive.
+
+\item Section~\ref{sec:Nakomoto_and_PoW}. Nakamoto consensus is a static rule: take the chain with the highest difficulty. No network communication is needed.
+
+\item Section~\ref{sec:PoS}. PoS is another Sybil resistance scheme: block producers are pre-defined, one has to spend the internal currency in order to have a chance to become a block producer. Thus, producing many blocks for a Sybil attack is expensive. 
+
+\item Section~\ref{sec:dags}. By using PoW or PoS one can make the network is synchronous if the average block proposal time is larger than the network latency. 
+
+\item  Section~\ref{sec:dags}. High block proposal rates are only possible in asynchronous networks with many forks. DAG is a data structure which allows a block to have many parents, efficiently keeping track of many intertwined forks. In general, if two blocks are conflicting, the one included in more (weighted) forks becomes canonical.
+
+\item  Section~\ref{sec:dags}. Building a Sybil-resistant decentralized asynchronous system with fast transaction confirmations (time to finality) is hard.
+
+\end{enumerate}
+  
+\section{Local views vs Global state }
+
+A blockchain is a distributed system whose state $S(t)$ evolves over time $t$, which we will treat  as time in seconds since the ``genesis'' event. A classical example of a state $S(t)$ is a ledger with account balances\footnote{Instead, a ledger may keep track of who owns UXTOs (unspent transaction outputs). This model is used by e.g. Bitcoin. See \cite{UXTO} for further explanation and discussion. } at time $t$, but it really can be anything (e.g. in Ethereum, it's the state of EVM, so in particular it contains all the states of all smart contracts in the network).
+However, it's tricky to define a global state $S$ for a distributed system and here is why.
+
+Each node $u$ participating in the network has its own \emph{view} $S_u(t)$ of the state at time $t$, so there are actually as many versions of the state as the number of nodes in the network. In order to define the global state $S(t)$ of the blockchain, we need to have an efficient consensus protocol which would allow all the participating nodes to agree on the same state and update their local views accordingly. In other words, the global state $S(t)$ is a version of the view at time $t$ everyone agrees upon. 
+
+Even worse, in \emph{inclusive} systems (i.e. anyone is free to join the network) some nodes may be malicious and try to interfere with the network. In this case we still want that the virtuous nodes, faithfully following the protocol, reach a consensus about $S(t)$. The exact network security requirements may vary and real world deployments should take into account economic incentives of the participants. See \cite{ButerinSecurityFrameworks} for further discussion about realistic frameworks.
+
+\section{State as a chain of blocks} \label{sec:chain}
+ The network nodes are going to reach consensus not only about the current global state, but also about the history $S(t)$ for each time $t = [0, \ldots, T]$ up to the present time $T$. 
+  
+ % Indeed, a naive approach would be to try agree on the whole %history $[S(0), S(1), \ldots, S(T)]$ each time there's a state %update. 
+  
+ % Such an approach is not only impractical from the computational point of view, but is also unusable in any meaningful way. We want to be sure that if our transaction was present in the global state $S(t)$ at time $T$, than at time $T+1$ the network consensus about the state at time $t$ is the very same $S(t)$, so our transaction is not lost.
+
+A natural approach is to represent a state $S(t)$ as a sequence of blocks $B_1, \ldots, B_{t-1}$ where the block $B_i$  contains all transactions included in $S(i+1)$, but not in $S(i)$. One can encode this as
+$$
+S(i+1) = S(i) \oplus B_{i-1},
+$$
+where $S(i) \oplus B_{i-1}$ means ``apply the transactions contained in $B_{i-1}$ to state $S(i)$''. 
+Then
+$$
+S(t) = B_0 \oplus B_{1} \oplus \ldots \oplus B_{t-1}.
+$$
+In particular, in order to reach consensus on $S(t)$, the network agrees on some sequence of transaction blocks of length $t-1$
+$$
+(B_1, \ldots, B_{t-1}).
+$$
+
+Algorithm~\ref{alg:algoGeneral} illustrates such an approach. Note that the most recent $t$ for which the local state $S(t)$ is known, as well as the ordering of the blocks, is completely determined by the routine $\Call{chooseBlockSequence}$, which should be considered as a block-box for now. A concrete implementation is a crucial part of any distributed ledger protocol which to a great extent determines the protocol security and robustness.
+
+In Section~\ref{sec:Nakomoto_and_PoW} we will consider an particularly elegant and efficient implementation of $\Call{chooseBlockSequence}$, suggested by Satoshi Nakamoto for Bitcoin. 
+
+%In particular, if a new block is produced roughly every second, %the length of $bseq$ at time $T$ should be approximately equal %to $T$, otherwise some blocks are missing from $\mathcal{B}$ %and the local state is lagging.
+
+
+\begin{algorithm} 
+\begin{algorithmic}[1] 
+\State $B_0 \gets \text{genesis}$
+\State $\mathcal{B} \gets \{ B_0 \}$ \Comment{Collection of all  blocks}
+\State $S[0] \gets \emptyset$ \Comment{Starting state}
+\While{true}
+	\If{$B \gets \Call{newBlock}$} 
+    	\State $\Call{addBlock}{B}$ \Comment{New block received}	
+        \State $bseq \gets \Call{chooseBlockSequence}{\mathcal{B}}$ 
+        \Loop{ $i=1$ to $length(bseq)$}
+        	\State $S[i] = \Call{applyBlock}{S[i-1], bseq[i]}$
+        \EndLoop
+    \EndIf
+\EndWhile
+\end{algorithmic}
+\caption{Update local view.}
+\label{alg:algoGeneral}
+\end{algorithm}
+
+Now assume we live in an ideal world where
+ 
+\begin{enumerate}
+   \item[A0] The routine $\Call{chooseBlockSequence}$ always returns a valid sequence of blocks, i.e. $\Call{applyBlock}$ at line 8 never fails and returns a valid state.  
+   
+   \item[A1] All nodes have the same version of $\mathcal{B}$ at the time a new block is produced.
+   
+   \item[A2] All nodes faithfully follow Algorithm~\ref{alg:algoGeneral}.
+  
+\end{enumerate}
+
+Then all nodes in the network have the same local view $S(t)$ for times $t$ up to the time the last block had arrived, since $\Call{chooseBlockSequence}$ is executed by each node with the same input. 
+
+\section{Double spend attacks} \label{sec:double_spend}
+
+
+   It turns out that even in an ideal world where the assumptions (A0), (A1), (A2) hold, the network is susceptible to the following double-spend attack. 
+
+   Assume for concreteness that $\Call{chooseBlockSequence}{\mathcal{B}}$ is implemented as follows: it outputs the longest valid sequence of blocks in $\mathcal{B}$\footnote{This implementation is similar to the one considered in Section~\ref{sec:Nakomoto_and_PoW} for the sake of concreteness. The outlined double-spend attack, however, is generic.}.
+   
+  Let Alice have $\$1$ on her account which she transfers to Bob in return for goodies. Alice's transaction $T_B$ is included in a block $B_1$. Bob observes $B_1$ (and hence $T_B$) in the global state by querying one of the nodes and sends the goodies. Next, Alice issues an another transaction $T'_B$ which sends $\$1$ to herself and submits to the network. She keeps submitting $T'_B$ to the network so that the fresh blocks include $T'_B$\footnote{We assume that all transactions submitted to the network are eventually included in some block.}. Note that if Alice has $\$1$ on her account, $T'_B$ remains a valid transaction no matter how many times it had already been applied. 
+  
+Sooner or later, each local copy of $\mathcal{B}$ will contain mostly blocks containing $T'_B$. At this point, $\Call{chooseBlockSequence}{\mathcal{B}}$, taking the longest valid sequence of blocks in $\mathcal{B}$, is going to include some blocks with $T'_B$ in the output sequence. But since $B_1$ conflicts with $T'_B$, $B_1$ is no longer included in a local view as long as at least one of the blocks with $T'_B$ is picked up by $\Call{chooseBlockSequence}{\mathcal{B}}$. Thus, $B_1$ will eventually be excluded from all the local views and the global state, as if $T_B$ had never been submitted: Alice has both $\$1$ on her account and the goodies.
+
+  There are two general ways\footnote{It's ideal world scenarios, in practice one should always replace ``always'' with ``likely'', and ``never'' or ``can't'' with ``unlikely'', with the exact meaning depending on the concrete setup.} to tackle the double spend attack described above.
+  \begin{enumerate}
+     \item[(EL)] {\bf Elitarian:} Regulate the way new blocks are produced so that Alice's conflicting transactions $T'_B$ can not be included in new blocks after the initial transaction $T_B$ is accepted as valid by the block producer.
+     
+     \item[(EG)] {\bf Egalitarian:} Any block can be produced, but  $\Call{chooseBlockSequence}$ guarantees the following.
+   \begin{itemize}  
+     \item[(F)] If at time $T$ a block $B$ is included in a local view $S_v(i)$ for some $i \leq T - t_0$, then it's \emph{final}, i.e. it will be always included in $S_v(i)$ in the future. It follows that once $B$ had been accepted in the global state since $t_0$ seconds ago, it will remain in the global state forever. 
+   \end{itemize}  
+     
+     For example, if $t_0 = 5$, then in the double-spend attack above Bob can simply wait $5$ seconds (till $T_B$ is ``confirmed'' in blockchain parlance), and after that it's guaranteed that $T_B$ will stay in the global state forever. The confirmation time $t_0$ is arguably the most important metric of a general-purpose cryptocurrency built on top of blockchain. 
+  \end{enumerate}
+  
+  
+Note the (EL) is stronger than (EG). Indeed, if (EL) holds, then no two blocks contain conflicting transactions. The implementation of $\Call{chooseBlockSequence}{\mathcal{B}}$ is trivial:
+simply output all the blocks in $\mathcal{B}$ in the order they have been produced. 
+
+An extreme scenario for the case (EL) is dictatorship: only a single node is allowed to produce blocks (e.g. only blocks cryptographically signed by a specific block producer are deemed valid), which essentially reduces the network to a distributed database with a single master and a bunch of read-only slaves. Indeed, centralized systems, e.g. VISA, are much more effective than present-generation blockchains\footnote{VISA can allegedly  handle 24000 transactions per second (tps), in comparison to 15-25tps of the Ethereum network. See e.g. \cite{tps} and references therein.} in terms of transaction speed and finality times. The problem is that the block producer should be always online and \emph{trusted}. A malicious block producer can censor out valid transactions\footnote{Think of VISA blocking transactions from your account.} or even go rogue and produce conflicting blocks. A more advanced and less centralized approach is to form committees who vote for block candidates, the winning block candidate becomes official\footnote{One of the notable examples is the EOS blockchain with $21$ designated block producers elected in advance by EOS token holders.  }. Such an approach gains popularity in combination with the Proof-of-Stake block proposal mechanism, discussed in Section~\ref{sec:PoS}. For a thorough discussion of centralisation vs scalability and an overview of existing projects in the space, see \cite{DLT}. For a philosophical and economical take on the problem of censorship see \cite{Censorship}.
+
+\section{Sybil attacks} \label{sec:sybil}
+
+   Systems implementing (F) may be completely inclusive, in a sense that any participant can leave or join the network at any time and produce blocks. It opens up a much larger set of attack vectors than in the elitarian approach. In particular, as we will shortly see, there must be a mechanism preventing an adversary to easily produce a large number of blocks and succeed in a \emph{Sybil attack}. 
+   
+   Recall Alice from Section~\ref{sec:double_spend} who submits a transaction $T_B$ with money to Bob, and asks goodies from Bob in return. Bob, now well aware of double spend attacks, is waiting until $T_B$ is deemed final. However, it turns out that if Alice can produce as many blocks as she wants, Bob can never be sure that $T_B$ is final and his hard-earned money is safe.
+   
+  Assume $T_B$ is in block $B_1$ as before. 
+   First, Alice makes another block $B'_1$ by removing $T_B$ from $B_1$ and broadcasts to the network. Next, each time a new block $B_i$ is produced, Alice forges her own block $B'_i$ by including only transactions compatible with $B'_1$ representing her ``alternative truth''.
+   
+   Now for all times $t$ there are two competing sequences of blocks:
+ \begin{equation} \label{eq:Bobtruth} \tag{CANONICAL}
+ (\ldots, B_1, B_2, \ldots, B_t)
+\end{equation}
+ which contains $T_B$, and
+ \begin{equation} \label{eq:Alicetruth} \tag{ALICE}
+ (\ldots, B'_1, B'_2, \ldots, B'_t),
+\end{equation}
+ prepared by Alice. In (\ref{eq:Alicetruth}) Alice has goodies for free since there are no transaction to Bob's account. 
+ 
+ 
+ The problem now is that $\Call{chooseBlockSequence}$ is a deterministic function, and there is no \emph{a priori} way to guarantee that (\ref{eq:Bobtruth}) is always preferred over (\ref{eq:Alicetruth}), even if $B_1$ was produced well before Alice's blocks.
+ 
+In fact, (\ref{eq:Bobtruth}) and (\ref{eq:Alicetruth}) are two equally valid alternative versions (called \emph{forks}) of the global state and the conflict cannot be resolved without any additional criteria distinguishing the ``fair'' blocks in (\ref{eq:Bobtruth}) from (\ref{eq:Alicetruth}). 
+ 
+ Summing up, if anyone can easily produce a valid block, nothing prevents Alice from building a plausible version of an alternative global state and break finality. Thus, even in open inclusive networks there should be some \emph{block proposal} mechanism that hinders mass production of legit blocks by a single participant. 
+    
+\section{Nakomoto consensus and PoW} \label{sec:Nakomoto_and_PoW}
+
+Skipping the glorious history\footnote{See e.g. \cite{ConsensusBlockchain}} of Proof-of-Work (aka PoW) with necessary kudos to Cynthia Dwork, Moni Naor (who invented Proof-of-Work) and Satoshi Nakomoto (who invented blockchain on top of it), let's get straight to why PoW is such a good solution against double spend and Sybil attacks. For a detailed description of the Bitcoin protocol, see \cite{bitcoin_wp}. 
+
+Satoshi's design relies on the following features.
+\begin{itemize}
+   \item[(T)] Each block contains a hash of it's parent block. 
+
+  \item[(D)] Each block $B$ has \emph{difficulty} $d(B)$, which is essentially 
+$$
+d(B) = 2^{\text{number of leading zeros of $hash(B)$}}
+$$
+Since $hash$ is pseudorandom, it's computationally hard to produce blocks with high difficulty: brute force is the only way.
+
+\end{itemize}
+
+The property (T) is very useful: it naturally induces a tree-like structure to the collection of blocks $\mathcal{B}$, with each block $B$ having a single parent block $p(B)$. Thus, implementing $\Call{chooseBlockSequence}{\mathcal{B}}$ becomes more pleasant: it suffices to pick a leaf block and reconstruct the sequence by traversing the tree up the genesis block $B_0$.
+
+%Apart from that, each block now has a \emph{height}, which is %simply the distance from the tree root. Formally, it's defined %recursively as follows:
+%\begin{enumerate}
+%   \item $height(B_0) = 0$
+%   \item $height(B) = height(B.parent) + 1$
+%\end{enumerate}
+%In many synchronous systems, like Bitcoin and Ethereum, blocks %are expected to be produced at approximate
+
+The property (D) provides a simple yet powerful way to choose forks: the one with higher total difficulty wins. 
+Both ideas are illustrated by Algorithm~\ref{alg:localUpdate} and Algorithm~\ref{alg:nakamotoConsensus}.
+
+\begin{algorithm} 
+\begin{algorithmic}[1] 
+
+\State $B_0.height \gets 0$
+\State $B_0.chainDifficulty \gets 0$
+\State $B_0.difficulty \gets 0$
+
+\Procedure{addBlock}{$B$}
+  
+  \State $pHash \gets B.pHash$
+  \If{$\mathcal{B}.contains(pHash)$}
+  	\State $parent \gets \mathcal{B}.get(pHash)$
+  \Else
+    \Comment{Parent block is missing, request from the peers}
+    \State $parent \gets \Call{download}{pHash}$ 	
+    \State $\Call{addBlock}{parent}$ 
+  \EndIf
+  \State $B.parent \gets parent$
+  \State $B.chainDifficulty \gets parent.chainDifficulty + B.difficulty$
+  \State $B.height \gets parent.height + 1$ \Comment{Height is the distance to the root $B_0$}
+  \State $\mathcal{B} \gets \mathcal{B} \cup B$
+\EndProcedure
+
+\end{algorithmic}
+\caption{Local tree update}
+\label{alg:localUpdate}
+\end{algorithm}
+
+\begin{algorithm}
+\begin{algorithmic}[1] 
+\Function{chooseBlockSequence}{$\mathcal{B}$}
+  \State $B \gets \Call{argmax}{B.chainDifficulty\text{ for $B$ in $\mathcal{B}$}}$
+  \State \Return  \Call{traverse}{$B$} \Comment{Return the sequence of blocks from $B_0$ to $B$}
+\EndFunction
+
+\end{algorithmic}
+\caption{Nakamoto consensus: the fork with the largest difficulty wins}
+\label{alg:nakamotoConsensus}
+\end{algorithm}
+
+It's worth noting that the \emph{consensus} protocol itself is simply an \emph{a priori} agreement between virtuous nodes to follow Algorithm~\ref{alg:nakamotoConsensus}. In principle, the block difficulty can be substituted with any function which gives a total block ordering, e.g. by comparing block timestamps. It would work as far as participants are fair\, albeit very vulnerable to rogue participants, like Alice in Section~\ref{sec:sybil}.
+Proof-Of-Work is a mechanism that makes the Nakamoto consensus resistant to Sybil attacks by making producing legit blocks hard. Strictly speaking, it has nothing to do with the consensus itself.
+
+So why and how exactly does Nakamoto consensus imply finality? 
+In fact, it does not provide 100\% finality guarantee, but rather says that an adversary should control at least $50\%$ of the total network computational power in order to produce a long legit fork\footnote{Or, to be precise, that the probability of a successful fork of length $k$ for an adversary with less than $50\%$ of computational power drops exponentially in $k$. }. 
+
+In Bitcoin, Ethereum and other PoW-based blockchains the blocks are produced by \emph{miners}, who produce (aka \emph{mine}) new blocks on top of the existing ones. Each block contains a special transaction which sends a reward to the miner address, together with all the fees from the transactions sealed in the block. Only the blocks forming the global state represent the ``truth'', so in order to get the rewards, a miner should produce a valid block with high difficulty.
+
+ Thus, miners in \emph{general} mine their blocks on top of the longest chain, so an adversary has to compete with the rest of the network in order to build an equally long fork\footnote{See \cite{Eyal_Sirer_2018} and \cite{ButerinSecurityFrameworks} for further discussion related to the skewed mining incentives known as ``selfish mining'' and ``uncle'' block rewards. The GHOST protocol \cite{GHOST}, partially implemented in Ethereum, uses a more secure modification of the ``longest chain wins'' rule.}. In particular, if an adversary has less than 50\% of the total computing power, the ``collaborative'' branch always grows faster (on average) than any alternative branch built by a sole miner. In particular, in order to build a legitimate fork (\ref{eq:Alicetruth}), Alice has to spend at least as much resources as the whole network has spent on the blocks in (\ref{eq:Bobtruth}) mined on top of $B_1$. A rule-of-thumb for Bitcoin is that it is relatively safe to consider a block final if 60 blocks were built on top of it\cite{BitcoinConfirmation}.  
+ 
+\section{Proof of Stake} \label{sec:PoS}
+
+Proof-of-Work is an exceptionally stable block proposal scheme, and it's still the \emph{only} battle-tested mechanism known to work well. The crucial problem with PoW is the tremendous amount of resources being spent on forging blocks with high difficulty \cite{BitcoinEnergy}.    
+   The main goal of Proof-of-Stake is to replicate the mechanics of PoW (based on the fact that computing power is expensive) with economic incentives -- based purely on the underlying cryptoasset.
+ 
+  Remember that PoW systems give only conditional finality of a block $B$ by claiming that 
+ \begin{enumerate}
+    \item[(1)] Either $B$ is part of the canonical chain
+    \item[(2)] Or someone has spent an overwhelming amount of resources\footnote{Sufficient to power Iceland for a year.} in order to outperform the difficulty of the canonical chain built on top of $B$.  
+ \end{enumerate}
+
+PoS systems replace it with ``economic finality'' by promising that \cite{PoSFAQ}
+ \begin{enumerate}
+    \item[(1)] Either $B$ is part of the canonical chain
+    \item[(2)] Or large number of people have deliberately burnt very large amount of money.  
+ \end{enumerate}
+ 
+   In a nutshell, PoS works as follows. A user submits a ``stake'' using a special transaction, which locks up some funds in the deposit. In return, the user gets a chance to produce a block (the exact circumstances on who and when produces blocks may vary greatly, see \cite{PoSFAQ}), she typically gets a reward, similarly to the mining reward in the PoW scheme. The higher the stake, the higher are the chances to become a block producer for the next round and get a mining reward. The fork choice rule (i.e. the implementation of $\Call{chooseBlockSequence}$) is also similar to Nakamoto consensus --  take the branch with the largest stake associated to it\footnote{It might be tweaked due to technical reasons, like in Casper FFG \cite{CasperFFG}. The premise remains -- the canonical branch concentrates the deposit value. }.
+
+However, there's an important ontological differences between the PoW and PoS approaches. PoW is an egalitarian approach since it relies on a universal \emph{external} resource (computational power) in order to gauge block proposals, finality is achieved as a by-product of rational behavior. PoS, however, relies on an \emph{internal} resource (underlying cryptoasset), explicitly narrowing the set of block producers for each block\footnote{Note that we use the terms elitarian (EL) and egalitarian (EG) strictly in the sense of Section~\ref{sec:double_spend}. PoW systems (like Bitcoin) are often elitarian in the usual economical sense as they require large investments in hardware in order to participate in mining. }.
+
+   PoS may seem like a perfect setup for preventing Sybil attacks: the probability that Alice mines a new block is roughly proportional to the stake she has, similar to the PoW case where the probability is proportional to the share of the total network computational resources. 
+   
+   
+   However, since producing PoS blocks is \emph{cheap}, nothing prevents Alice from producing two blocks simultaneously on top of (\ref{eq:Bobtruth}) and (\ref{eq:Alicetruth}). Even worse, all subsequent block producers, having no prior knowledge whether (\ref{eq:Bobtruth}) or (\ref{eq:Alicetruth}) is going to become the canonical chain, will mine their blocks on top of both chains in order to guarantee that their block is always included and secure the mining reward. It then follows that Alice can oust (\ref{eq:Bobtruth}) having substantially less than half of the total network resources (i.e. total stakes).
+   
+   This problem, known as \emph{nothing-at-stake}, is rather serious and considerably complicates any PoS design. The general line of thought is to burn the producer's deposit if it is possible to give a cryptographic evidence that the block producer was cheating, e.g. by providing two conflicting blocks signed by the same block producer. There are extra complications coming from the fact that the block producers come and go, so it's possible to punish a malicious block producers only as long as the staking deposit is locked. The implementation details are beyond the scope of the note, so we refer the interested reader to \cite{PoSFAQ}, where different flavours of PoS are discussed. 
+  
+\section{DAGs and partial order} \label{sec:dags}
+
+The systems considered so far were \emph{synchronous}, which means that most of the miners have the same collection of blocks $\mathcal{B}$ at the time a new block is produced. Both PoW (by adjusting the threshold for block difficulty) and PoS (by explicitly assigning time windows for block proposals) schemes are designed in such a way that the average time till a new valid block is proposed exceeds the network latency with some room to spare.
+
+Still, if it happens that two valid blocks are proposed within a short period of time, it's inevitable that at least one of them is not included in the canonical chain (or \emph{orphaned} in blockchain parlance) since they both have the same parent block. Thus, the transaction throughput in synchronous single-chain systems is inevitably capped by the number of transactions in the block divided by the network latency. This is a serious challenge, since increasing the maximal block size increases\footnote{The issue whether or not Bitcoin block size should be increased resulted in a deep chasm within the Bitcoin community in July 2017. Two incompatible forks were created on top of block no. $478558$. Each fork is now a ledger for its own currency: Bitcoin (BTC) and Bitcoin Cash (BCH).} latency and may compromise the protocol security (see e.g. \cite{GHOST}).
+
+In order to increase the throughput, once has to  weaken the synchronicity condition (A1) of Section~\ref{sec:chain}: honest nodes may no longer have the same local data $\mathcal{B}$ at the time a new block is produced. On the other hand, it is natural to expect the nodes likely share a large portion of information, and \emph{eventually} any block or transaction will be received by each node. In what follows we will still assume for the sake of consistency that transactions are batched in blocks as before, though in many cases one can do single transactions in the same fashion, e.g. \cite{IOTA}.
+
+Recall that in the PoW setup a rational miner, in order to maximize the chances that her block is included in the canonical chain, would mine her block on top of the longest chain. In other words, by choosing where to mine a new block, a miner places a bet (equivalent to the computational resources being spent) that the parent block is the last in the global state and that she will be the first to propose a new valid block on top of it.
+
+In fact, it is a winner-takes-it-all situation: 
+\begin{enumerate}
+\item only a single block is accepted;
+\item the more computational power one has the higher are chances to win the bet;
+\item participants with low computational power are virtually out of the game.
+\end{enumerate}
+
+The idea is to allow the participants to place multiple bets, so that a new block can endorse multiple parents at the same time. In order to accommodate this, it is convenient to use another \emph{data structure} for the collection of blocks $\mathcal{B}$. Up until now, $\mathcal{B}$ had a tree structure: each block, except for the genesis block $B_0$, had a single parent. Now we simply allow multiple parents, so $\mathcal{B}$ becomes a directied acyclyc graph (DAG) (see e.g. \cite{DAGwiki} for a formal definition and general background).
+
+The philosophy behind the DAG approach is that having multiple parents, each block is included in a large amount of small interconnected forks. Such a complex entangled system, continuously updated by independent rational actors, is expected to be \emph{metastable} in the following sense. If two  blocks $B_0$ and $B_1$ are conflicting, 
+and, say, $B_0$ happen to receive just slightly more support (i.e. included in just a few more forks than $B_1$), then $B_0$ will quickly become \emph{much} more popular while $B_1$ will be abandoned. What is important here is that even though each node in the network has it own local DAG view and updates arrive in a random order, the preference of $B_0$ over $B_1$ becomes evident in all the local views, so it becomes a global consensus that $B_0$ is canonical while $B_1$ is abandoned. 
+
+In theory, the DAG approach has clear advantages, especially in a highly asynchronous environment.
+\begin{enumerate}
+   \item[(NC)] There's no competition between miners mining on top of the same block.
+   
+   \item[(INC)] Participants even with very few computational resources may non-trivially contribute to the strength of the network consensus (like the total difficulty of the longest chain in the Nakamoto consensus). Thus, the network throughput can in theory scale horizontally with the number of clients.
+   
+   \item[(FL)] The distribution of trust is more flexible: a block may be accepted even if one of the parents is not accepted.
+\end{enumerate}
+
+Mining a block (assuming for simplicity it contains a single transaction $T$) is outilined in  Algorithm~\ref{alg:dag_mining}.
+\begin{algorithm}
+\begin{algorithmic}[1] 
+\Procedure{mine}{$T$} 
+  \State $tips \gets \Call{getTips}{\mathcal{B}, T}$ \Comment{Choose some parent blocks compatible with $T$}
+  \State $\Call{verify}{tips, T}$
+  \State $B \gets \Call{generateBlock}{tips, T}$ 
+  \State $\Call{broadcast}{B}$
+\EndProcedure
+
+\end{algorithmic}
+\caption{Mining a block with multiple parents}
+\label{alg:dag_mining}
+\end{algorithm}
+
+DAG systems, however, are still susceptible to double-spend and Sybil attacks, which are considerably more difficult to tackle than in synchronous networks. Implementing Sybil-resistance while having (INC) is especially challenging: while it should be cheap to participate in the network consensus for a single user, it should be very expensive to flood the network with many cheap transactions and shift the consensus on one's will. Although the research in this direction is very active, it seems that the prevailing line of thought is to somehow integrate either PoW or PoS scheme.
+
+
+Finality becomes much harder as well\footnote{And, strictly speaking, impossible due to the infamous FLP theorem \cite{FLP}. In practice, one can do rather well without breaking FLP by using e.g. randomness, assuming bounded latency etc.}: one should be able to decide whether a transaction is final based on a single \emph{local} view, which may be substantially different from the others. Note, that in synchronous systems one can estimate with high accuracy if a local view is lagging behind by analyzing the timestamp of the last accepted block. Rigorous analysis is hard, especially in the presence of adversarial nodes, so current DAG-based solutions use ad-hoc solutions which serve as an anchor to the ground truth: special witnesses (ByteBall)\cite{ByteBall}, a separate PoW-based snapshot (Vite)\cite{Vite}, or  a special ``coordinator'' node (IOTA)\cite{IOTAcoordinator}.
+
+%Up until now, we assumed the State Machine %approach: all nodes have to agree on the global %state $S_t$ at time $t$, a block $B_t$ defines the %set of transactions transforming $S_t$ into %$S_{t+1}$. 
+
+A notable exception is the SPECTRE protocol \cite{Spectre}, which provably satisfies the following properties with arbitrarily high probility using only PoW:
+\begin{itemize}
+  \item[(C)] Consistency: no two accepted transactions are conflicting 
+  
+  \item[(S)] If a transaction is accepted by an honest node, it will be accepted forever by all honest nodes in the network within reasonable time. 
+  
+  \item[(L)] If a transaction is valid, it is accepted by all honest nodes within reasonable time.
+\end{itemize}
+
+Finally, let us mention a plethora of robust pure consensus protocols based on gossiping (communicating with random peers), notably\footnote{This list is by no means exhaustive.} Algorand \cite{Algorand}, Hashgraph \cite{Hashgraph}, Avalanche \cite{Avalanche}, Tendermint \cite{Tendermint}. These protocols can in principle be applied on top of any data structure in order to reach a global consensus on e.g. which of two conflicting transactions are canonical. In particular, it might be the case that underlying ideas can be used in order to improve the performance of DAG-based systems.
+
+%A Directed Acyclic Graph (DAG) is a data %structure, which extends a tree in the following %way: each block is allowed to have multiple parents. 
+
+
+%valid blocks should be included in the local view %of the system even if they are ``late to the %party'' and far behind the most recent ones known %to the node. 
+
+%A natural idea is to use wasted blocks with useful %transactions but nevertheless not included in the %canonical chain. In particular, the global state %should be able accept blocks from multiple branches %as long as no two transactions in the branches are %conflicting. 
+
+%A Directed Acyclic Graph (DAG) is a data %structure, which extends a tree in the following %way: each block is allowed to have multiple %parents. So any tree is a DAG, but a DAG allows %additional edges between tree branches.
+
+
+
+
+%\section{Security attacks} \label{sec:security}
+%
+%The exact network security requirements may vary. %Vitalik Buterin suggests %\cite{ButerinSecurityFrameworks} the following %settings for analyzing blockchain security, and %notes that reality is a mix between them. 
+
+%\begin{enumerate}
+% \item {\bf Normal-case model:} there are no %attackers. Either everyone is altruistic, or %everyone is rational but acts in an uncoordinated %way.
+ 
+% \item {\bf Byzantine fault tolerance model:} a %certain percentage of all nodes are attackers, and %the rest are honest altruistic people.
+
+% \item {\bf Economic model:} there is an attacker %with a budget of \$X which the attacker can spend %to either purchase their own hardware or bribe %other users, who are rational.
+%\end{enumerate}
+
+%\section{Further developments} \ref{sec:further}
+
+
+\bibliographystyle{plain}
+\bibliography{blockchain}
+
+
+\end{document}
